@@ -24,5 +24,3 @@ IncludeCategories:
     Priority:        2
   - Regex:           '.*'
     Priority:        1
-
-
