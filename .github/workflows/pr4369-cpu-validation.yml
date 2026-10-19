@@ -1,0 +1,91 @@
+name: PR 4369 CPU validation
+
+on:
+  push:
+    branches: [validation/pr4369-cpu-20261019]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      NO_GPU_EXT: "1"
+      MAX_JOBS: "2"
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE: "0.0.0"
+      LMCACHE_TRACK_USAGE: "false"
+      PYTHONHASHSEED: "0"
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c97f06e356bcca1b426f396ef93ec35ce149ce7b
+        with:
+          version: "0.13.1"
+          python-version: "3.12"
+          activate-environment: true
+          enable-cache: false
+      - name: Install CPU dependencies
+        run: |
+          uv pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -r requirements/build.txt -r requirements/test.txt -r requirements/common.txt pre-commit
+          uv run --no-sync .venv/bin/python -m pre_commit install
+      - name: Build real CPU extensions
+        run: |
+          uv pip install -e . --no-build-isolation
+          uv run --no-sync .venv/bin/python .github/scripts/assert_native_ops.py lmcache.lmcache_native
+          mkdir -p validation-results
+          uv pip freeze > validation-results/environment.txt
+      - name: Run P2P controller suite
+        id: focused
+        run: |
+          uv run --no-sync .venv/bin/python -m pytest -v tests/v1/multiprocess/test_p2p_controller.py --junitxml=validation-results/patched.xml
+          uv run --no-sync .venv/bin/python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = [c for c in ET.parse("validation-results/patched.xml").iter("testcase") if c.attrib["name"].startswith("test_poll_retries_removal_before_forgetting_or_replacing_peer")]
+          assert len(cases) == 2, len(cases)
+          assert all(not list(c) for c in cases), "Regression cases must run and pass"
+          PY
+      - name: Verify both regressions fail on unmodified dev
+        id: baseline
+        run: |
+          controller=lmcache/v1/multiprocess/modules/p2p_controller.py
+          cp "$controller" "$RUNNER_TEMP/p2p_controller.patched.py"
+          trap 'cp "$RUNNER_TEMP/p2p_controller.patched.py" "$controller"' EXIT
+          git show 654aa568cbd1c4bc265efff055c697f04cf2f2fb:"$controller" > "$controller"
+          set +e
+          uv run --no-sync .venv/bin/python -m pytest -q tests/v1/multiprocess/test_p2p_controller.py -k test_poll_retries_removal_before_forgetting_or_replacing_peer --junitxml=validation-results/baseline.xml
+          result=$?
+          set -e
+          test "$result" -eq 1
+          uv run --no-sync .venv/bin/python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse("validation-results/baseline.xml").iter("testcase"))
+          assert len(cases) == 2, len(cases)
+          assert all(c.find("failure") is not None and c.find("error") is None and c.find("skipped") is None for c in cases)
+          PY
+      - name: Run repository quality checks
+        run: |
+          SKIP=rust-fmt,rust-clippy uv run --no-sync .venv/bin/python -m pre_commit run --all-files
+          git diff --exit-code
+      - name: Test combination with PR 5790
+        if: ${{ !cancelled() && steps.focused.outcome == 'success' && steps.baseline.outcome == 'success' }}
+        run: |
+          git restore --worktree .
+          git fetch https://github.com/LMCache/LMCache.git refs/pull/5790/head
+          test "$(git rev-parse FETCH_HEAD)" = "3494c16f6db307f0393acc9eff77476f47009678"
+          merged_tree=$(git merge-tree --write-tree HEAD FETCH_HEAD)
+          git read-tree --reset -u "$merged_tree"
+          uv run --no-sync .venv/bin/python -m pytest -v tests/v1/multiprocess/test_p2p_controller.py tests/v1/distributed/test_runtime_adapter_timeouts.py --junitxml=validation-results/combined.xml
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: pr4369-cpu-validation
+          path: validation-results/
+          if-no-files-found: ignore
+          retention-days: 14
